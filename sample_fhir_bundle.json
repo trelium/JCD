@@ -1,0 +1,158 @@
+{
+  "resourceType": "Bundle",
+  "id": "sample-blood-panel-001",
+  "type": "collection",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "Patient",
+        "id": "patient-demo-001",
+        "gender": "male",
+        "birthDate": "1978-04-15"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-cholesterol",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "2093-3", "display": "Total Cholesterol" }]
+        },
+        "valueQuantity": { "value": 238, "unit": "mg/dL" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 0 }, "high": { "value": 200 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-ldl",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "13457-7", "display": "LDL Cholesterol" }]
+        },
+        "valueQuantity": { "value": 162, "unit": "mg/dL" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 0 }, "high": { "value": 130 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-hdl",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "2085-9", "display": "HDL Cholesterol" }]
+        },
+        "valueQuantity": { "value": 42, "unit": "mg/dL" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 40 }, "high": { "value": 999 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-triglycerides",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "3043-7", "display": "Triglycerides" }]
+        },
+        "valueQuantity": { "value": 195, "unit": "mg/dL" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 0 }, "high": { "value": 150 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-glucose",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "2345-7", "display": "Glucose (fasting)" }]
+        },
+        "valueQuantity": { "value": 108, "unit": "mg/dL" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 70 }, "high": { "value": 100 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-hba1c",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "4548-4", "display": "HbA1c" }]
+        },
+        "valueQuantity": { "value": 5.9, "unit": "%" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 0 }, "high": { "value": 5.7 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-hscrp",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "30522-7", "display": "C-Reactive Protein (hs)" }]
+        },
+        "valueQuantity": { "value": 3.8, "unit": "mg/L" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 0 }, "high": { "value": 1.0 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-hemoglobin",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "718-7", "display": "Hemoglobin" }]
+        },
+        "valueQuantity": { "value": 14.8, "unit": "g/dL" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 13.5 }, "high": { "value": 17.5 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-creatinine",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "2157-6", "display": "Creatinine" }]
+        },
+        "valueQuantity": { "value": 1.05, "unit": "mg/dL" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 0.7 }, "high": { "value": 1.3 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-alt",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "1742-6", "display": "ALT" }]
+        },
+        "valueQuantity": { "value": 28, "unit": "U/L" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 7 }, "high": { "value": 56 } }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-ferritin",
+        "status": "final",
+        "code": {
+          "coding": [{ "system": "http://loinc.org", "code": "2276-4", "display": "Ferritin" }]
+        },
+        "valueQuantity": { "value": 145, "unit": "ng/mL" },
+        "effectiveDateTime": "2024-11-01T08:30:00Z",
+        "referenceRange": [{ "low": { "value": 20 }, "high": { "value": 250 } }]
+      }
+    }
+  ]
+}

@@ -1,0 +1,173 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Local development stack
+# Run: docker compose up --build
+# ---------------------------------------------------------------------------
+
+x-worker-env: &worker-env
+  DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/biomarker
+  KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ENV: development
+
+services:
+
+  # --------------------------------------------------------------------------
+  # Message broker — Redpanda is Kafka-compatible, single binary, no JVM
+  # --------------------------------------------------------------------------
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --smp 1
+      - --memory 512M
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy: true'"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # Redpanda console (optional, web UI for inspecting topics)
+  redpanda-console:
+    image: redpandadata/console:latest
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # Postgres
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: biomarker
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --------------------------------------------------------------------------
+  # Redis — for caching and optional Celery beat if needed later
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # NHANES seeder — runs once, exits
+  # --------------------------------------------------------------------------
+  nhanes-loader:
+    build:
+      context: .
+      dockerfile: services/nhanes/Dockerfile
+    environment:
+      <<: *worker-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # FastAPI web service
+  # --------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      <<: *worker-env
+      MAX_UPLOAD_MB: "10"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Validation worker (scale with: docker compose up --scale validation-worker=3)
+  # --------------------------------------------------------------------------
+  validation-worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    command: ["python", "-m", "services.worker.validation_worker"]
+    environment:
+      <<: *worker-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      nhanes-loader:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Analysis worker
+  # --------------------------------------------------------------------------
+  analysis-worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    command: ["python", "-m", "services.worker.analysis_worker"]
+    environment:
+      <<: *worker-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Report worker
+  # --------------------------------------------------------------------------
+  report-worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    command: ["python", "-m", "services.worker.report_worker"]
+    environment:
+      <<: *worker-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pg_data:

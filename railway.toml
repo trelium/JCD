@@ -1,0 +1,62 @@
+[build]
+builder = "dockerfile"
+
+# ---------------------------------------------------------------------------
+# API — public-facing web service
+# ---------------------------------------------------------------------------
+[[services]]
+name = "api"
+dockerfile = "services/api/Dockerfile"
+
+[services.deploy]
+healthcheckPath    = "/health"
+healthcheckTimeout = 30
+restartPolicyType  = "on_failure"
+restartPolicyMaxRetries = 5
+
+# ---------------------------------------------------------------------------
+# Validation worker
+# ---------------------------------------------------------------------------
+[[services]]
+name = "validation-worker"
+dockerfile = "services/worker/Dockerfile"
+
+[services.deploy]
+startCommand = "python -m services.worker.validation_worker"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# ---------------------------------------------------------------------------
+# Analysis worker
+# ---------------------------------------------------------------------------
+[[services]]
+name = "analysis-worker"
+dockerfile = "services/worker/Dockerfile"
+
+[services.deploy]
+startCommand = "python -m services.worker.analysis_worker"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# ---------------------------------------------------------------------------
+# Report worker
+# ---------------------------------------------------------------------------
+[[services]]
+name = "report-worker"
+dockerfile = "services/worker/Dockerfile"
+
+[services.deploy]
+startCommand = "python -m services.worker.report_worker"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# ---------------------------------------------------------------------------
+# NHANES loader — one-shot, run manually via Railway CLI or dashboard
+# ---------------------------------------------------------------------------
+[[services]]
+name = "nhanes-loader"
+dockerfile = "services/nhanes/Dockerfile"
+
+[services.deploy]
+startCommand = "python services/nhanes/loader.py"
+restartPolicyType = "never"
