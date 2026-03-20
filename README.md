@@ -1,6 +1,28 @@
 # Biomarker Pipeline
 
-An end-to-end production pipeline that accepts FHIR-formatted blood panel files, validates biomarkers against NHANES population reference data, scores cardiovascular/metabolic risk, and generates GP-ready clinical reports using Claude.
+An end-to-end production pipeline that accepts FHIR-formatted blood panel files, validates biomarkers against NHANES population reference data, scores cardiovascular/metabolic risk, and generates GP-ready clinical reports with an AI-generated narrative.
+
+---
+
+## Overview
+
+The pipeline is built around a set of design properties that make it suitable for production deployment at scale.
+
+**Asynchronous, decoupled processing.** The API accepts an upload and returns a job ID immediately — no blocking. Work is queued in Postgres and processed by independent worker services. The client polls for completion. This means the web service never becomes a bottleneck regardless of how long individual jobs take.
+
+**Horizontal scaling via competing consumers.** Workers poll a shared Postgres job queue using `SELECT FOR UPDATE SKIP LOCKED` — a battle-tested pattern that allows any number of worker replicas to consume work concurrently with no double-processing. Increasing throughput is a single slider in the Railway dashboard. Each pipeline stage (validation, analysis, report) scales independently, so you can add capacity exactly where the bottleneck is.
+
+**Fault tolerance and retry.** Failed jobs are automatically retried up to three times with exponential back-off. After exhausting retries the job is marked `dlq` (dead-letter) rather than silently lost, making failures visible and recoverable. Workers that crash mid-job leave the row in its current status — on restart they pick up where they left off.
+
+**Idempotency.** Every upload is SHA-256 hashed. Duplicate submissions return the existing job instantly rather than reprocessing, making the API safe to call multiple times without side effects.
+
+**Structured observability.** All services emit structured JSON logs via `structlog` with consistent field names across every stage transition, error, and external API call. On Railway these stream directly to the log viewer and can be forwarded to any aggregator.
+
+**Schema-validated data contracts.** All internal data passed between pipeline stages is validated by Pydantic v2 models. Malformed FHIR input is rejected at parse time with a clear error rather than propagating corrupt data downstream.
+
+**Zero-downtime deploys.** Each service is independently deployable. Rolling out a new report template or updated risk scoring logic requires redeploying only the relevant worker — the API and other workers keep running.
+
+---
 
 ## Architecture
 
@@ -8,142 +30,112 @@ An end-to-end production pipeline that accepts FHIR-formatted blood panel files,
 Upload (FHIR JSON/XML)
         │
         ▼
-  FastAPI /upload  ──────────────────────────────────────┐
-        │                                                 │
-        │ Kafka: fhir-ingest                              │
-        ▼                                                 │
-  Validation worker (×N)                                  │
-    · Parse FHIR                                          │
-    · Check vs NHANES percentiles                         │
-    · Flag anomalies                                      │
-        │                                                 │
-        │ Kafka: fhir-validated                           │
-        ▼                                                 │
-  Analysis worker (×N)                          Postgres  │
-    · Risk scoring                               (jobs +  │
-    · Cohort percentiles                          refs)   │
-    · Plotly chart data                                   │
-        │                                                 │
-        │ Kafka: fhir-analysed                            │
-        ▼                                                 │
-  Report worker                                           │
-    · Claude API narrative                                │
-    · HTML report render                                  │
-        │                                                 │
-        └──────────────── Job COMPLETE ───────────────────┘
+  FastAPI /upload
+        │  returns job_id immediately
+        │  stores raw bytes + metadata in Postgres
+        ▼
+  ┌─────────────────────────────────────────┐
+  │           Postgres job queue            │
+  │  status: pending → validating →         │
+  │          analyzing → reporting →        │
+  │          complete / dlq                 │
+  └─────────────────────────────────────────┘
+        │
+        ▼
+  Validation worker (×N replicas)
+    · Parse FHIR JSON or XML
+    · Look up NHANES percentiles by age + sex
+    · Flag anomalies with severity + percentile position
+    · Compute data quality score
+        │
+        ▼
+  Analysis worker (×N replicas)
+    · Weighted composite risk score (0–100)
+    · Per-biomarker cohort percentiles
+    · Plotly chart data
+    · Plain-language key findings
+        │
+        ▼
+  Report worker
+    · LLM-generated clinical narrative
+    · Full HTML report with embedded chart
+        │
+        ▼
+  Job marked COMPLETE
 
 Client polls GET /status/{job_id}
-Client fetches GET /report/{job_id}  → rendered HTML
+Client fetches GET /report/{job_id} → rendered HTML report
 ```
-
-**Production readiness features:**
-- Horizontal scaling: add worker replicas via `--scale` or Railway replica count
-- Fault tolerance: Kafka retains messages; workers retry 3× with exponential back-off then route to `.dlq` topic
-- Idempotency: duplicate uploads (same SHA-256) return cached job immediately
-- Observability: structured JSON logs via `structlog` on every stage transition
-- Health/readiness: `/health` (liveness) and `/ready` (checks DB + Kafka) on the API
-- Schema validation: Pydantic v2 on all internal models; FHIR schema validated by `fhir.resources`
-- DB migrations: Alembic with async support
-- Rate limiting: 20 uploads/minute per IP via SlowAPI
 
 ---
 
-## Local development
+## Horizontal scaling
+
+Each of the three worker types is a stateless process that polls the job queue independently. Scaling any of them is additive — add replicas and throughput increases linearly until the database becomes the constraint (which happens at a much higher volume than a typical clinical workload).
+
+**On Railway**, scaling is done per service:
+
+```
+Service → Settings → Replicas → set to N
+```
+
+Workers coordinate automatically through `SELECT FOR UPDATE SKIP LOCKED` — no configuration changes required when adding replicas.
+
+**Stage-level scaling.** The three stages have different computational profiles:
+
+- Validation is fast (database lookups, in-memory computation) — 1–2 replicas typically sufficient
+- Analysis is slightly heavier (Plotly chart serialisation) — scale to 2–3 under load
+- Report generation is I/O bound on the LLM API call — scale to match your Anthropic API concurrency limit
+
+**Identifying the bottleneck.** If jobs are piling up in a particular status (visible by querying the `jobs` table), that stage needs more replicas. A simple query:
+
+```sql
+SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY count DESC;
+```
+
+**Database scaling.** The Postgres connection pool is set to 10 connections per worker process with a max overflow of 20. With N replicas of M workers, peak connections = N × M × 30. On Railway's free Postgres tier this is fine up to a few dozen replicas total. For higher scale, add PgBouncer as a connection pooler in front of Postgres.
+
+---
+
+## Deployment (Railway)
 
 ### Prerequisites
-- Docker + Docker Compose
-- Python 3.12 (for running outside Docker)
 
-### Start everything
+- GitHub repository with this code
+- Railway account (free tier sufficient)
+- Anthropic API key with active credit balance
 
-```bash
-# Clone and enter the repo
-git clone <your-repo>
-cd biomarker-pipeline
+### Services to create
 
-# Copy and fill in your Anthropic API key (optional — reports work without it, narrative is skipped)
-cp .env.example .env
-# edit .env and set ANTHROPIC_API_KEY=sk-ant-...
+Create five services in Railway, all pointing at the same GitHub repo:
 
-# Build and start all services
-docker compose up --build
+| Service name | `RAILWAY_DOCKERFILE_PATH` | Start command |
+|---|---|---|
+| `api` | `services/api/Dockerfile` | *(from Dockerfile)* |
+| `validation-worker` | `services/worker/Dockerfile` | `python -m services.worker.validation_worker` |
+| `analysis-worker` | `services/worker/Dockerfile` | `python -m services.worker.analysis_worker` |
+| `report-worker` | `services/worker/Dockerfile` | `python -m services.worker.report_worker` |
+| `nhanes-loader` | `services/nhanes/Dockerfile` | `python services/nhanes/loader.py` |
 
-# First run: wait for nhanes-loader to finish seeding (~5-10 min, downloads CDC data)
-docker compose logs -f nhanes-loader
-```
+### Environment variables
 
-Services will be available at:
-- **Web UI**: http://localhost:8000
-- **API docs**: http://localhost:8000/docs
-- **Redpanda console**: http://localhost:8080
+Set these on every service:
 
-### Test with the sample file
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | From Railway Postgres plugin — change `postgresql://` to `postgresql+asyncpg://` |
+| `ANTHROPIC_API_KEY` | Your Anthropic key |
+| `ENV` | `production` |
 
-```bash
-# Upload the included sample FHIR bundle
-curl -X POST http://localhost:8000/upload \
-  -F "file=@sample_fhir_bundle.json"
+### Deploy order
 
-# Response: {"job_id": "...", "status": "pending", ...}
-# Poll status:
-curl http://localhost:8000/status/<job_id>
+1. Add a **PostgreSQL** plugin to the project (Railway dashboard → New → Database → PostgreSQL)
+2. Deploy **nhanes-loader** first and wait for it to complete — it seeds the reference ranges table
+3. Deploy the remaining four services — they can all be deployed simultaneously
 
-# Once status=complete, open the report:
-open http://localhost:8000/report/<job_id>
-```
+### Public URL
 
-### Scale workers locally
-
-```bash
-docker compose up --scale validation-worker=3 --scale analysis-worker=2
-```
-
----
-
-## Railway deployment (free tier)
-
-### One-time setup
-
-1. **Push repo to GitHub**
-
-2. **Create Railway project**
-   - Go to https://railway.app → New Project → Deploy from GitHub repo
-   - Select your repository
-
-3. **Add database plugins** (Railway dashboard → New → Database):
-   - PostgreSQL
-   - (For Kafka/Redpanda: use Upstash Kafka from the Railway Marketplace — free tier available)
-
-4. **Set environment variables** on each service (Settings → Variables):
-
-   | Variable | Value |
-   |---|---|
-   | `DATABASE_URL` | Copy from Railway Postgres plugin (change `postgresql://` to `postgresql+asyncpg://`) |
-   | `KAFKA_BOOTSTRAP_SERVERS` | From Upstash Kafka plugin |
-   | `ANTHROPIC_API_KEY` | Your Anthropic key |
-   | `ENV` | `production` |
-
-5. **Run the NHANES seeder once**
-   - In Railway dashboard, open the `nhanes-loader` service
-   - Click "Deploy" — it runs once and exits
-   - Check logs to confirm seeding completed successfully
-
-6. **Verify the API is live**
-   - Open the public URL Railway assigns to the `api` service
-   - You should see the upload UI
-
-### Scaling on Railway
-
-In the Railway dashboard, select any worker service → Settings → Replicas → increase to 2 or 3.
-Kafka consumer group coordination handles the load distribution automatically.
-
-### Running Alembic migrations manually
-
-```bash
-# From your local machine with DATABASE_URL set
-pip install alembic asyncpg sqlalchemy
-alembic upgrade head
-```
+In the `api` service → Settings → Networking → Generate Domain. Set the port to `8000`.
 
 ---
 
@@ -151,41 +143,39 @@ alembic upgrade head
 
 ```
 biomarker-pipeline/
-├── docker-compose.yml          # Local dev stack
 ├── railway.toml                # Railway service definitions
+├── docker-compose.yml          # Local dev stack
 ├── alembic.ini                 # DB migration config
-├── sample_fhir_bundle.json     # Test file
+├── sample_fhir_bundle.json     # Sample input — normal/moderate risk
 │
 ├── requirements/
-│   ├── api.txt
-│   ├── worker.txt
-│   └── nhanes.txt
+│   ├── api.txt                 # API service dependencies
+│   ├── worker.txt              # Worker service dependencies
+│   └── nhanes.txt              # NHANES loader dependencies
 │
-├── shared/                     # Code shared across all services
-│   ├── models/models.py        # Pydantic data models
-│   ├── kafka/kafka_utils.py    # Producer/consumer + retry logic
-│   ├── db/database.py          # SQLAlchemy async engine + ORM models
+├── shared/
+│   ├── models/models.py        # Pydantic data models for all stages
+│   ├── kafka/kafka_utils.py    # Postgres job queue (poll + retry logic)
+│   ├── db/database.py          # SQLAlchemy async engine + ORM
 │   └── logging_config.py       # structlog JSON configuration
 │
 ├── services/
 │   ├── api/
-│   │   ├── main.py             # FastAPI app + upload/status/report routes
+│   │   ├── main.py             # FastAPI — upload, status, report, health
 │   │   └── Dockerfile
-│   │
 │   ├── worker/
-│   │   ├── fhir_parser.py      # FHIR JSON + XML → internal models
+│   │   ├── fhir_parser.py      # FHIR R4 JSON + XML → internal models
 │   │   ├── validation_worker.py # Stage 1: parse + validate vs NHANES
 │   │   ├── analysis_worker.py  # Stage 2: risk scoring + Plotly charts
-│   │   ├── report_worker.py    # Stage 3: Claude narrative + HTML render
+│   │   ├── report_worker.py    # Stage 3: LLM narrative + HTML render
 │   │   └── Dockerfile
-│   │
 │   └── nhanes/
-│       ├── loader.py           # Seeds reference_ranges from CDC data
+│       ├── loader.py           # Seeds reference_ranges table on first run
 │       └── Dockerfile
 │
 └── infra/
     └── migrations/
-        ├── env.py              # Alembic async setup
+        ├── env.py
         └── versions/
             └── 0001_initial_schema.py
 ```
@@ -194,26 +184,48 @@ biomarker-pipeline/
 
 ## FHIR input format
 
-The pipeline accepts a FHIR R4 Bundle containing:
-- One `Patient` resource (for age/sex stratification)
-- One or more `Observation` resources with LOINC-coded blood biomarkers
+The pipeline accepts a FHIR R4 Bundle containing one `Patient` resource and one or more LOINC-coded `Observation` resources. Both JSON and XML serialisations are supported.
 
-See `sample_fhir_bundle.json` for a complete example.
+The `Patient` resource is used for age/sex stratification against NHANES reference distributions. If omitted, the pipeline falls back to population-wide (unstratified) percentiles.
 
-Supported LOINC codes and biomarkers: Total Cholesterol (2093-3), LDL (13457-7), HDL (2085-9), Triglycerides (3043-7), Glucose (2345-7), HbA1c (4548-4), hsCRP (30522-7), Creatinine (2157-6), BUN (3094-0), ALT (1742-6), AST (1920-8), Ferritin (2276-4), Hemoglobin (718-7), WBC (6690-2), Platelets (777-3), Sodium (2947-0), Potassium (6298-4), and more.
+See `sample_fhir_bundle.json` for a complete working example.
+
+**Supported biomarkers (LOINC codes):** Total Cholesterol (2093-3), LDL (13457-7), HDL (2085-9), Triglycerides (3043-7), Fasting Glucose (2345-7), HbA1c (4548-4), hsCRP (30522-7), Creatinine (2157-6), BUN (3094-0), ALT (1742-6), AST (1920-8), Ferritin (2276-4), Hemoglobin (718-7), WBC (6690-2), Platelets (777-3), Sodium (2947-0), Potassium (6298-4), Albumin (1751-7), Total Bilirubin (1975-2), Alkaline Phosphatase (6768-6), Calcium (17861-6), Total Protein (2885-2).
+
+---
+
+## Risk scoring
+
+The composite risk score (0–100) is a weighted sum of per-biomarker risk contributions. Each biomarker's contribution is derived from its percentile position in the age/sex-stratified NHANES distribution — not from fixed clinical thresholds. This means the score reflects where the patient sits relative to the real-world population, not just whether they crossed an arbitrary cutoff.
+
+HDL is treated as a protective factor: low HDL contributes positively to risk, high HDL contributes nothing.
+
+| Score | Tier |
+|---|---|
+| 0–19 | Low |
+| 20–44 | Moderate |
+| 45–69 | High |
+| 70–100 | Urgent |
+
+The severity badges in the results table (Normal / Borderline / Abnormal / Critical) use different thresholds — they reflect the percentile position of each individual biomarker in isolation, independent of the composite score. A patient can show all Normal badges and still receive a Moderate composite score if several biomarkers are simultaneously in the upper quartile.
 
 ---
 
 ## Reference data
 
-Population reference ranges are derived from the **NHANES 2017–2018** dataset (National Health and Nutrition Examination Survey, CDC). Percentile distributions are stratified by sex (male/female) and age band (0–17, 18–29, 30–39, 40–49, 50–59, 60–69, 70+). Data is downloaded directly from the CDC public server at first run — no license or API key required.
+Population reference ranges are derived from the **NHANES 2017–2018** dataset (National Health and Nutrition Examination Survey, CDC), stratified by sex and age band (18–29, 30–39, 40–49, 50–59, 60–69, 70+). The percentile distributions are bundled directly in the loader rather than downloaded at runtime, making deployment independent of external data availability.
 
 ---
 
 ## Extending the pipeline
 
-**Add a new biomarker**: add an entry to `BIOMARKER_MAP` in `services/nhanes/loader.py` with the LOINC code, NHANES variable name, XPT file URL, and unit. Re-run the loader.
+**Add a new biomarker.** Add an entry to `REFERENCE_DATA` in `services/nhanes/loader.py` with LOINC code, display name, unit, and percentile values per age/sex stratum. Re-run the nhanes-loader service.
 
-**Add a new pipeline stage**: create a new worker module, add a new Kafka topic in `kafka_utils.ensure_topics`, subscribe the new worker to the upstream topic, publish to a new downstream topic, add the service to `docker-compose.yml` and `railway.toml`.
+**Add a new pipeline stage.** Add a new worker module in `services/worker/`, define the input status it polls for, update the status transition in `shared/kafka/kafka_utils.py`, and add the service to `railway.toml`.
 
-**Swap Claude model**: change `CLAUDE_MODEL` in `services/worker/report_worker.py`.
+**Change the LLM model.** Update `CLAUDE_MODEL` in `services/worker/report_worker.py`.
+
+**Run Alembic migrations.**
+```bash
+DATABASE_URL=postgresql+asyncpg://... alembic upgrade head
+```
