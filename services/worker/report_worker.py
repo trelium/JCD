@@ -51,7 +51,10 @@ SEVERITY_BADGE = {
 async def generate_narrative(patient_id, age, sex, risk_tier, risk_score, findings, flags, quality) -> str:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
+        log.warning("report.no_api_key", msg="ANTHROPIC_API_KEY not set in environment")
         return _fallback(risk_tier, findings)
+
+    log.info("report.calling_claude", model=CLAUDE_MODEL, key_prefix=api_key[:12] + "...")
 
     abnormal = [
         f"{f['display_name']}: {f['value']} {f.get('unit','')} ({f.get('note','')})"
@@ -93,7 +96,9 @@ Be factual and clinical. Do not diagnose. Do not prescribe."""
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
-            r.raise_for_status()
+            if r.status_code != 200:
+                log.warning("report.claude_bad_status", status=r.status_code, body=r.text[:500])
+                return _fallback(risk_tier, findings)
             return r.json()["content"][0]["text"]
     except Exception as exc:
         log.warning("report.claude_failed", error=str(exc))
@@ -180,7 +185,7 @@ tbody tr{{border-bottom:1px solid #f1f3f5}}
       <div style="font-size:.8rem;color:#adb5bd;max-width:360px;text-align:right">Reference ranges from NHANES 2017–2018, stratified by age and sex. For GP review only — not a diagnosis.</div>
     </div>
   </div>
-  <div class="footer">Biomarker Pipeline · Ahead Health Demo · {now.year}</div>
+  <div class="footer">Biomarker Pipeline · System Demo · {now.year}</div>
 </div>
 <script>Plotly.newPlot('chart',{chart_json}.data,{chart_json}.layout,{{responsive:true,displayModeBar:false}});</script>
 </body></html>"""
