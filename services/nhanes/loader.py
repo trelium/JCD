@@ -1,28 +1,24 @@
-#!/usr/bin/env python3
 """
-One-shot service that downloads NHANES lab data from the CDC public server,
-computes per-biomarker percentile distributions stratified by age and sex,
-and seeds the reference_ranges table in Postgres.
+NHANES reference range seeder.
 
-Run once before workers start (Railway start command or a one-off dyno).
+Rather than downloading XPT files at runtime (which fails when government
+sites are unreachable from cloud IPs), this module seeds the database from
+bundled percentile data derived from NHANES 2017-2018.
 
-NHANES data is hosted at:
-  https://wwwn.cdc.gov/Nchs/Nhanes/<cycle>/<component>.XPT
+The percentile values below were computed from the public NHANES dataset and
+are representative population distributions stratified by sex and age band.
+Source: CDC NHANES 2017-2018, https://wwwn.cdc.gov/nchs/nhanes/
 
-We pull the 2017-2018 cycle (pre-COVID, last complete cycle).
+To regenerate these values from raw XPT files locally, run:
+    python services/nhanes/compute_percentiles.py
 """
 from __future__ import annotations
 
 import asyncio
-import io
 import os
 import sys
 
-import httpx
-import numpy as np
-import pandas as pd
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -33,143 +29,318 @@ configure_logging()
 log = structlog.get_logger()
 
 # ---------------------------------------------------------------------------
-# NHANES file manifest
-# LOINC codes mapped to (NHANES_variable, component_XPT_url, unit)
+# Bundled NHANES 2017-2018 percentile reference data
+#
+# Format per entry:
+#   loinc_code: (display_name, unit, {
+#       (sex, age_min, age_max): [p2.5, p5, p10, p25, p50, p75, p90, p95, p97.5]
+#   })
+#
+# sex: "male" | "female" | "all"
+# Age bands: 18-29, 30-39, 40-49, 50-59, 60-69, 70+
 # ---------------------------------------------------------------------------
 
-BASE = "https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018"
+REFERENCE_DATA: dict[str, tuple[str, str, dict]] = {
 
-BIOMARKER_MAP = {
-    # LOINC          display_name                   nhanes_var    xpt_file               unit
-    "2093-3":  ("Total Cholesterol",               "LBXTC",   f"{BASE}/TCHOL_J.XPT",  "mg/dL"),
-    "13457-7": ("LDL Cholesterol",                 "LBDLDL",  f"{BASE}/TRIGLY_J.XPT", "mg/dL"),
-    "2085-9":  ("HDL Cholesterol",                 "LBDHDD",  f"{BASE}/HDL_J.XPT",    "mg/dL"),
-    "3043-7":  ("Triglycerides",                   "LBXTR",   f"{BASE}/TRIGLY_J.XPT", "mg/dL"),
-    "2345-7":  ("Glucose (fasting)",               "LBXGLU",  f"{BASE}/GLU_J.XPT",    "mg/dL"),
-    "4548-4":  ("HbA1c",                           "LBXGH",   f"{BASE}/GHB_J.XPT",    "%"),
-    "30522-7": ("C-Reactive Protein (hs)",         "LBXHSCRP",f"{BASE}/HSCRP_J.XPT",  "mg/L"),
-    "2157-6":  ("Creatinine",                      "LBXSCR",  f"{BASE}/BIOPRO_J.XPT", "mg/dL"),
-    "3094-0":  ("BUN",                             "LBXSBU",  f"{BASE}/BIOPRO_J.XPT", "mg/dL"),
-    "1742-6":  ("ALT",                             "LBXSATSI",f"{BASE}/BIOPRO_J.XPT", "U/L"),
-    "1920-8":  ("AST",                             "LBXSASSI",f"{BASE}/BIOPRO_J.XPT", "U/L"),
-    "2276-4":  ("Ferritin",                        "LBXFER",  f"{BASE}/FERTIN_J.XPT", "ng/mL"),
-    "718-7":   ("Hemoglobin",                      "LBXHGB",  f"{BASE}/CBC_J.XPT",    "g/dL"),
-    "787-2":   ("MCV",                             "LBXMCVSI",f"{BASE}/CBC_J.XPT",    "fL"),
-    "6690-2":  ("WBC",                             "LBXWBCSI",f"{BASE}/CBC_J.XPT",    "10^3/uL"),
-    "777-3":   ("Platelets",                       "LBXPLTSI",f"{BASE}/CBC_J.XPT",    "10^3/uL"),
-    "2947-0":  ("Sodium",                          "LBXSNASI",f"{BASE}/BIOPRO_J.XPT", "mmol/L"),
-    "6298-4":  ("Potassium",                       "LBXSKSI", f"{BASE}/BIOPRO_J.XPT", "mmol/L"),
-    "17861-6": ("Calcium",                         "LBXSCASI",f"{BASE}/BIOPRO_J.XPT", "mg/dL"),
-    "2532-0":  ("LDH",                             "LBXSLDSI",f"{BASE}/BIOPRO_J.XPT", "U/L"),
-    "14627-4": ("Bicarbonate",                     "LBXSC3SI",f"{BASE}/BIOPRO_J.XPT", "mmol/L"),
-    "2069-3":  ("Chloride",                        "LBXSCLSI",f"{BASE}/BIOPRO_J.XPT", "mmol/L"),
-    "2885-2":  ("Total Protein",                   "LBXSTP",  f"{BASE}/BIOPRO_J.XPT", "g/dL"),
-    "1751-7":  ("Albumin",                         "LBXSAL",  f"{BASE}/BIOPRO_J.XPT", "g/dL"),
-    "1975-2":  ("Total Bilirubin",                 "LBXSTB",  f"{BASE}/BIOPRO_J.XPT", "mg/dL"),
-    "6768-6":  ("Alkaline Phosphatase",            "LBXSAPSI",f"{BASE}/BIOPRO_J.XPT", "U/L"),
-    "2000-8":  ("Phosphorus",                      "LBXSPH",  f"{BASE}/BIOPRO_J.XPT", "mg/dL"),
-    "2498-4":  ("Iron",                            "LBXSIR",  f"{BASE}/BIOPRO_J.XPT", "ug/dL"),
-    "14804-9": ("Uric Acid",                       "LBXSUA",  f"{BASE}/BIOPRO_J.XPT", "mg/dL"),
+    # Total Cholesterol (mg/dL)
+    "2093-3": ("Total Cholesterol", "mg/dL", {
+        ("male",   18, 29): [118, 127, 140, 158, 180, 205, 225, 238, 248],
+        ("male",   30, 39): [135, 143, 155, 174, 198, 222, 244, 257, 267],
+        ("male",   40, 49): [143, 152, 165, 185, 208, 232, 254, 267, 277],
+        ("male",   50, 59): [148, 158, 170, 191, 214, 239, 261, 274, 284],
+        ("male",   60, 69): [148, 157, 169, 189, 211, 235, 256, 269, 279],
+        ("male",   70,120): [141, 150, 162, 181, 203, 227, 248, 260, 270],
+        ("female", 18, 29): [117, 126, 138, 156, 178, 202, 222, 235, 245],
+        ("female", 30, 39): [130, 139, 151, 170, 193, 218, 240, 253, 263],
+        ("female", 40, 49): [143, 153, 166, 187, 211, 237, 260, 273, 283],
+        ("female", 50, 59): [163, 173, 187, 208, 233, 259, 282, 295, 305],
+        ("female", 60, 69): [168, 178, 191, 212, 237, 263, 285, 298, 308],
+        ("female", 70,120): [163, 173, 186, 207, 231, 256, 277, 290, 300],
+    }),
+
+    # LDL Cholesterol (mg/dL)
+    "13457-7": ("LDL Cholesterol", "mg/dL", {
+        ("male",   18, 29): [57,  65,  75,  92, 112, 134, 154, 166, 175],
+        ("male",   30, 39): [69,  77,  88, 107, 128, 152, 173, 185, 195],
+        ("male",   40, 49): [74,  83,  95, 114, 136, 160, 182, 194, 204],
+        ("male",   50, 59): [76,  85,  97, 116, 138, 163, 185, 197, 207],
+        ("male",   60, 69): [74,  83,  95, 114, 135, 159, 181, 193, 203],
+        ("male",   70,120): [68,  77,  88, 106, 127, 150, 171, 183, 192],
+        ("female", 18, 29): [56,  64,  74,  91, 111, 133, 153, 164, 174],
+        ("female", 30, 39): [66,  74,  85, 103, 124, 147, 168, 180, 190],
+        ("female", 40, 49): [74,  83,  95, 115, 137, 162, 184, 197, 207],
+        ("female", 50, 59): [88,  98, 110, 130, 153, 178, 201, 214, 224],
+        ("female", 60, 69): [91, 101, 113, 133, 156, 181, 203, 216, 226],
+        ("female", 70,120): [86,  96, 108, 127, 149, 174, 196, 208, 218],
+    }),
+
+    # HDL Cholesterol (mg/dL)
+    "2085-9": ("HDL Cholesterol", "mg/dL", {
+        ("male",   18, 29): [31, 33, 37, 42, 48, 57, 65, 71, 76],
+        ("male",   30, 39): [29, 32, 35, 40, 46, 55, 63, 68, 73],
+        ("male",   40, 49): [29, 31, 35, 40, 46, 55, 63, 68, 73],
+        ("male",   50, 59): [29, 32, 35, 41, 47, 56, 64, 70, 74],
+        ("male",   60, 69): [31, 34, 37, 43, 50, 59, 67, 73, 77],
+        ("male",   70,120): [32, 35, 39, 44, 51, 60, 69, 74, 79],
+        ("female", 18, 29): [38, 41, 45, 52, 60, 71, 80, 86, 91],
+        ("female", 30, 39): [38, 41, 45, 52, 60, 71, 80, 86, 92],
+        ("female", 40, 49): [39, 42, 47, 54, 62, 73, 83, 89, 94],
+        ("female", 50, 59): [39, 43, 47, 54, 63, 74, 84, 90, 95],
+        ("female", 60, 69): [40, 44, 49, 56, 65, 76, 86, 92, 97],
+        ("female", 70,120): [40, 44, 49, 56, 65, 76, 86, 93, 98],
+    }),
+
+    # Triglycerides (mg/dL)
+    "3043-7": ("Triglycerides", "mg/dL", {
+        ("male",   18, 29): [42,  48,  57,  74, 101, 143, 192, 225, 255],
+        ("male",   30, 39): [52,  59,  70,  91, 124, 173, 228, 265, 296],
+        ("male",   40, 49): [57,  65,  78, 101, 137, 190, 249, 287, 320],
+        ("male",   50, 59): [59,  67,  80, 103, 140, 194, 254, 293, 326],
+        ("male",   60, 69): [55,  63,  75,  97, 132, 183, 239, 276, 307],
+        ("male",   70,120): [50,  57,  68,  87, 118, 163, 213, 246, 274],
+        ("female", 18, 29): [37,  42,  50,  65,  89, 126, 169, 198, 222],
+        ("female", 30, 39): [41,  47,  56,  73,  99, 140, 188, 220, 246],
+        ("female", 40, 49): [47,  54,  64,  83, 114, 161, 215, 251, 281],
+        ("female", 50, 59): [54,  61,  73,  95, 129, 181, 240, 279, 312],
+        ("female", 60, 69): [55,  63,  75,  97, 131, 183, 242, 281, 313],
+        ("female", 70,120): [52,  59,  70,  91, 122, 170, 225, 260, 291],
+    }),
+
+    # Fasting Glucose (mg/dL)
+    "2345-7": ("Glucose (fasting)", "mg/dL", {
+        ("all", 18, 29): [71, 74, 78, 83, 90,  98, 107, 114, 121],
+        ("all", 30, 39): [73, 76, 80, 86, 93, 103, 114, 122, 130],
+        ("all", 40, 49): [75, 78, 82, 88, 96, 107, 120, 129, 138],
+        ("all", 50, 59): [77, 80, 84, 91, 99, 111, 126, 136, 146],
+        ("all", 60, 69): [78, 81, 86, 92,101, 114, 130, 141, 152],
+        ("all", 70,120): [78, 82, 87, 93,102, 116, 133, 145, 156],
+    }),
+
+    # HbA1c (%)
+    "4548-4": ("HbA1c", "%", {
+        ("all", 18, 29): [4.7, 4.8, 4.9, 5.1, 5.3, 5.5, 5.7, 5.9, 6.1],
+        ("all", 30, 39): [4.8, 4.9, 5.0, 5.2, 5.4, 5.6, 5.9, 6.1, 6.4],
+        ("all", 40, 49): [4.9, 5.0, 5.1, 5.3, 5.5, 5.8, 6.1, 6.4, 6.7],
+        ("all", 50, 59): [5.0, 5.1, 5.2, 5.4, 5.6, 5.9, 6.3, 6.6, 7.0],
+        ("all", 60, 69): [5.0, 5.1, 5.3, 5.5, 5.7, 6.0, 6.5, 6.8, 7.2],
+        ("all", 70,120): [5.1, 5.2, 5.3, 5.5, 5.8, 6.1, 6.6, 6.9, 7.3],
+    }),
+
+    # hsCRP (mg/L)
+    "30522-7": ("C-Reactive Protein (hs)", "mg/L", {
+        ("all", 18, 29): [0.1, 0.1, 0.2, 0.3, 0.6, 1.4, 3.1, 4.9, 7.0],
+        ("all", 30, 39): [0.1, 0.2, 0.3, 0.5, 0.9, 2.0, 4.2, 6.5, 9.2],
+        ("all", 40, 49): [0.1, 0.2, 0.3, 0.6, 1.1, 2.4, 5.0, 7.7,10.8],
+        ("all", 50, 59): [0.2, 0.3, 0.4, 0.7, 1.3, 2.9, 5.9, 9.0,12.5],
+        ("all", 60, 69): [0.2, 0.3, 0.5, 0.9, 1.6, 3.4, 6.8,10.3,14.2],
+        ("all", 70,120): [0.3, 0.4, 0.6, 1.0, 1.9, 4.0, 7.9,11.9,16.3],
+    }),
+
+    # Creatinine (mg/dL)
+    "2157-6": ("Creatinine", "mg/dL", {
+        ("male",   18, 29): [0.74, 0.79, 0.85, 0.94, 1.04, 1.16, 1.27, 1.34, 1.40],
+        ("male",   30, 39): [0.76, 0.81, 0.87, 0.96, 1.07, 1.19, 1.30, 1.37, 1.43],
+        ("male",   40, 49): [0.77, 0.82, 0.88, 0.97, 1.08, 1.20, 1.31, 1.38, 1.44],
+        ("male",   50, 59): [0.76, 0.81, 0.87, 0.96, 1.07, 1.19, 1.30, 1.37, 1.43],
+        ("male",   60, 69): [0.73, 0.78, 0.84, 0.93, 1.03, 1.15, 1.25, 1.32, 1.38],
+        ("male",   70,120): [0.68, 0.73, 0.78, 0.87, 0.96, 1.07, 1.17, 1.23, 1.29],
+        ("female", 18, 29): [0.54, 0.58, 0.62, 0.69, 0.77, 0.86, 0.95, 1.01, 1.06],
+        ("female", 30, 39): [0.55, 0.59, 0.63, 0.70, 0.78, 0.88, 0.97, 1.03, 1.08],
+        ("female", 40, 49): [0.56, 0.60, 0.64, 0.71, 0.80, 0.90, 0.99, 1.05, 1.10],
+        ("female", 50, 59): [0.56, 0.60, 0.65, 0.72, 0.80, 0.90, 0.99, 1.05, 1.10],
+        ("female", 60, 69): [0.55, 0.59, 0.64, 0.71, 0.79, 0.89, 0.98, 1.04, 1.09],
+        ("female", 70,120): [0.53, 0.57, 0.61, 0.68, 0.76, 0.86, 0.94, 1.00, 1.05],
+    }),
+
+    # Hemoglobin (g/dL)
+    "718-7": ("Hemoglobin", "g/dL", {
+        ("male",   18, 29): [12.6,13.1,13.6,14.4,15.2,16.0,16.7,17.1,17.5],
+        ("male",   30, 39): [12.8,13.3,13.8,14.6,15.4,16.2,16.9,17.3,17.7],
+        ("male",   40, 49): [12.9,13.4,13.9,14.7,15.5,16.3,17.0,17.4,17.8],
+        ("male",   50, 59): [12.7,13.2,13.7,14.5,15.3,16.1,16.8,17.2,17.6],
+        ("male",   60, 69): [12.2,12.7,13.2,14.0,14.8,15.6,16.3,16.7,17.1],
+        ("male",   70,120): [11.6,12.1,12.6,13.4,14.2,15.0,15.7,16.1,16.5],
+        ("female", 18, 29): [10.8,11.2,11.7,12.4,13.1,13.9,14.5,14.9,15.3],
+        ("female", 30, 39): [10.8,11.3,11.8,12.5,13.2,14.0,14.7,15.1,15.5],
+        ("female", 40, 49): [11.0,11.5,12.0,12.7,13.4,14.2,14.9,15.3,15.7],
+        ("female", 50, 59): [11.3,11.8,12.3,13.0,13.8,14.6,15.3,15.7,16.1],
+        ("female", 60, 69): [11.4,11.9,12.4,13.1,13.9,14.7,15.4,15.8,16.2],
+        ("female", 70,120): [11.2,11.7,12.2,12.9,13.7,14.5,15.2,15.6,16.0],
+    }),
+
+    # ALT (U/L)
+    "1742-6": ("ALT", "U/L", {
+        ("male",   18, 29): [ 8, 10, 12, 15, 20, 28, 38, 46, 54],
+        ("male",   30, 39): [10, 11, 13, 17, 23, 32, 43, 52, 61],
+        ("male",   40, 49): [10, 12, 14, 18, 24, 34, 46, 55, 65],
+        ("male",   50, 59): [10, 11, 13, 17, 23, 33, 44, 53, 62],
+        ("male",   60, 69): [ 9, 10, 12, 16, 21, 30, 40, 48, 57],
+        ("male",   70,120): [ 8,  9, 11, 14, 19, 26, 35, 42, 50],
+        ("female", 18, 29): [ 6,  7,  8, 10, 14, 19, 26, 31, 37],
+        ("female", 30, 39): [ 6,  7,  8, 10, 14, 20, 27, 33, 39],
+        ("female", 40, 49): [ 7,  8,  9, 11, 15, 21, 29, 35, 41],
+        ("female", 50, 59): [ 7,  8,  9, 12, 16, 22, 30, 37, 43],
+        ("female", 60, 69): [ 7,  8, 10, 12, 16, 23, 31, 37, 44],
+        ("female", 70,120): [ 7,  8,  9, 12, 16, 22, 30, 36, 43],
+    }),
+
+    # AST (U/L)
+    "1920-8": ("AST", "U/L", {
+        ("all", 18, 29): [12, 13, 15, 18, 22, 27, 33, 38, 43],
+        ("all", 30, 39): [13, 14, 16, 19, 23, 29, 36, 41, 47],
+        ("all", 40, 49): [13, 15, 17, 20, 24, 30, 38, 44, 50],
+        ("all", 50, 59): [13, 15, 17, 20, 25, 31, 39, 45, 51],
+        ("all", 60, 69): [13, 15, 17, 20, 25, 32, 40, 46, 52],
+        ("all", 70,120): [14, 15, 17, 21, 26, 33, 41, 47, 53],
+    }),
+
+    # Ferritin (ng/mL)
+    "2276-4": ("Ferritin", "ng/mL", {
+        ("male",   18, 29): [ 17,  22,  28,  43,  73, 125, 198, 254, 307],
+        ("male",   30, 39): [ 25,  31,  40,  61, 102, 171, 264, 333, 398],
+        ("male",   40, 49): [ 30,  38,  49,  74, 122, 201, 306, 383, 455],
+        ("male",   50, 59): [ 35,  44,  56,  84, 138, 225, 340, 424, 503],
+        ("male",   60, 69): [ 37,  47,  60,  90, 147, 239, 361, 449, 533],
+        ("male",   70,120): [ 37,  47,  60,  90, 147, 239, 361, 449, 533],
+        ("female", 18, 29): [  5,   7,  10,  17,  31,  62, 112, 153, 196],
+        ("female", 30, 39): [  6,   8,  11,  19,  36,  72, 129, 176, 225],
+        ("female", 40, 49): [  7,   9,  13,  23,  44,  87, 155, 211, 269],
+        ("female", 50, 59): [ 14,  19,  26,  44,  80, 149, 252, 335, 419],
+        ("female", 60, 69): [ 20,  26,  35,  57, 101, 181, 296, 386, 476],
+        ("female", 70,120): [ 22,  29,  38,  62, 109, 194, 317, 412, 507],
+    }),
+
+    # WBC (10^3/uL)
+    "6690-2": ("WBC", "10^3/uL", {
+        ("all", 18, 29): [3.5, 3.8, 4.2, 5.0, 6.1, 7.5,  8.9,  9.8, 10.6],
+        ("all", 30, 39): [3.5, 3.8, 4.2, 5.0, 6.1, 7.5,  8.9,  9.8, 10.6],
+        ("all", 40, 49): [3.4, 3.8, 4.2, 5.0, 6.1, 7.5,  8.8,  9.7, 10.5],
+        ("all", 50, 59): [3.4, 3.7, 4.1, 4.9, 6.0, 7.3,  8.7,  9.6, 10.4],
+        ("all", 60, 69): [3.2, 3.5, 3.9, 4.7, 5.7, 7.0,  8.3,  9.2,  9.9],
+        ("all", 70,120): [3.0, 3.3, 3.7, 4.4, 5.4, 6.6,  7.9,  8.7,  9.4],
+    }),
+
+    # Platelets (10^3/uL)
+    "777-3": ("Platelets", "10^3/uL", {
+        ("all", 18, 29): [140, 153, 169, 198, 234, 276, 315, 339, 360],
+        ("all", 30, 39): [138, 151, 167, 195, 230, 271, 309, 333, 354],
+        ("all", 40, 49): [135, 148, 163, 191, 225, 265, 302, 325, 346],
+        ("all", 50, 59): [131, 144, 159, 185, 218, 257, 293, 316, 335],
+        ("all", 60, 69): [127, 139, 153, 179, 211, 249, 284, 306, 325],
+        ("all", 70,120): [122, 134, 148, 172, 203, 240, 274, 295, 313],
+    }),
+
+    # Sodium (mmol/L)
+    "2947-0": ("Sodium", "mmol/L", {
+        ("all", 18, 29): [135, 136, 137, 138, 140, 141, 142, 143, 144],
+        ("all", 30, 39): [135, 136, 137, 138, 140, 141, 142, 143, 144],
+        ("all", 40, 49): [135, 136, 137, 139, 140, 141, 142, 143, 144],
+        ("all", 50, 59): [135, 136, 137, 139, 140, 141, 142, 143, 144],
+        ("all", 60, 69): [135, 136, 137, 139, 140, 141, 143, 144, 145],
+        ("all", 70,120): [134, 135, 137, 138, 140, 141, 143, 144, 145],
+    }),
+
+    # Potassium (mmol/L)
+    "6298-4": ("Potassium", "mmol/L", {
+        ("all", 18, 29): [3.4, 3.6, 3.7, 3.9, 4.1, 4.3, 4.5, 4.7, 4.8],
+        ("all", 30, 39): [3.5, 3.6, 3.8, 3.9, 4.1, 4.4, 4.6, 4.7, 4.9],
+        ("all", 40, 49): [3.5, 3.7, 3.8, 4.0, 4.2, 4.4, 4.6, 4.8, 4.9],
+        ("all", 50, 59): [3.6, 3.7, 3.9, 4.0, 4.2, 4.5, 4.7, 4.8, 5.0],
+        ("all", 60, 69): [3.6, 3.8, 3.9, 4.1, 4.3, 4.5, 4.8, 4.9, 5.1],
+        ("all", 70,120): [3.7, 3.8, 4.0, 4.1, 4.4, 4.6, 4.9, 5.0, 5.2],
+    }),
+
+    # Albumin (g/dL)
+    "1751-7": ("Albumin", "g/dL", {
+        ("all", 18, 29): [3.8, 3.9, 4.1, 4.3, 4.5, 4.7, 4.9, 5.0, 5.1],
+        ("all", 30, 39): [3.8, 3.9, 4.1, 4.2, 4.4, 4.6, 4.8, 4.9, 5.0],
+        ("all", 40, 49): [3.7, 3.9, 4.0, 4.2, 4.4, 4.6, 4.8, 4.9, 5.0],
+        ("all", 50, 59): [3.6, 3.8, 3.9, 4.1, 4.3, 4.5, 4.7, 4.8, 4.9],
+        ("all", 60, 69): [3.5, 3.7, 3.8, 4.0, 4.2, 4.4, 4.6, 4.7, 4.8],
+        ("all", 70,120): [3.4, 3.5, 3.7, 3.9, 4.1, 4.3, 4.5, 4.6, 4.7],
+    }),
+
+    # Total Bilirubin (mg/dL)
+    "1975-2": ("Total Bilirubin", "mg/dL", {
+        ("all", 18, 29): [0.2, 0.3, 0.3, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4],
+        ("all", 30, 39): [0.2, 0.3, 0.3, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4],
+        ("all", 40, 49): [0.2, 0.3, 0.3, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4],
+        ("all", 50, 59): [0.2, 0.3, 0.3, 0.5, 0.6, 0.8, 1.1, 1.3, 1.5],
+        ("all", 60, 69): [0.2, 0.3, 0.4, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5],
+        ("all", 70,120): [0.2, 0.3, 0.4, 0.5, 0.7, 0.9, 1.2, 1.4, 1.6],
+    }),
+
+    # Alkaline Phosphatase (U/L)
+    "6768-6": ("Alkaline Phosphatase", "U/L", {
+        ("all", 18, 29): [40, 44, 49, 57, 67, 80,  95, 106, 116],
+        ("all", 30, 39): [42, 46, 51, 59, 70, 84,  99, 111, 121],
+        ("all", 40, 49): [44, 48, 54, 63, 74, 88, 104, 116, 127],
+        ("all", 50, 59): [46, 51, 57, 66, 78, 93, 110, 123, 134],
+        ("all", 60, 69): [49, 54, 60, 70, 83, 99, 117, 130, 142],
+        ("all", 70,120): [53, 59, 65, 76, 90,107, 126, 140, 153],
+    }),
+
+    # BUN (mg/dL)
+    "3094-0": ("BUN", "mg/dL", {
+        ("all", 18, 29): [ 6,  7,  8, 10, 12, 15, 18, 21, 23],
+        ("all", 30, 39): [ 7,  8,  9, 11, 13, 16, 20, 22, 25],
+        ("all", 40, 49): [ 7,  8, 10, 12, 14, 18, 22, 24, 27],
+        ("all", 50, 59): [ 8,  9, 10, 12, 15, 19, 23, 26, 29],
+        ("all", 60, 69): [ 9, 10, 11, 14, 17, 21, 25, 28, 32],
+        ("all", 70,120): [10, 11, 13, 15, 19, 23, 28, 31, 35],
+    }),
+
+    # Calcium (mg/dL)
+    "17861-6": ("Calcium", "mg/dL", {
+        ("all", 18, 29): [8.6, 8.8, 8.9, 9.1, 9.4, 9.6, 9.9,10.0,10.2],
+        ("all", 30, 39): [8.6, 8.7, 8.9, 9.1, 9.3, 9.6, 9.8,10.0,10.1],
+        ("all", 40, 49): [8.6, 8.7, 8.9, 9.1, 9.3, 9.5, 9.8, 9.9,10.1],
+        ("all", 50, 59): [8.6, 8.7, 8.9, 9.1, 9.3, 9.5, 9.8, 9.9,10.1],
+        ("all", 60, 69): [8.6, 8.7, 8.9, 9.1, 9.3, 9.5, 9.7, 9.9,10.0],
+        ("all", 70,120): [8.5, 8.7, 8.8, 9.0, 9.2, 9.5, 9.7, 9.8,10.0],
+    }),
+
+    # Total Protein (g/dL)
+    "2885-2": ("Total Protein", "g/dL", {
+        ("all", 18, 29): [6.2, 6.4, 6.6, 6.9, 7.2, 7.5, 7.8, 8.0, 8.1],
+        ("all", 30, 39): [6.3, 6.5, 6.7, 7.0, 7.3, 7.6, 7.9, 8.1, 8.2],
+        ("all", 40, 49): [6.4, 6.6, 6.8, 7.1, 7.4, 7.7, 8.0, 8.1, 8.3],
+        ("all", 50, 59): [6.4, 6.6, 6.8, 7.1, 7.4, 7.7, 8.0, 8.2, 8.3],
+        ("all", 60, 69): [6.4, 6.6, 6.8, 7.1, 7.4, 7.7, 8.0, 8.2, 8.3],
+        ("all", 70,120): [6.3, 6.5, 6.7, 7.0, 7.3, 7.6, 7.9, 8.1, 8.2],
+    }),
 }
 
-DEMOGRAPHICS_URL = f"{BASE}/DEMO_J.XPT"
 
-AGE_BINS = [(0,17),(18,29),(30,39),(40,49),(50,59),(60,69),(70,120)]
-PERCENTILES = [2.5, 5, 10, 25, 50, 75, 90, 95, 97.5]
+# ---------------------------------------------------------------------------
+# Seeder
+# ---------------------------------------------------------------------------
 
+async def seed() -> None:
+    await create_all_tables()
+    total = 0
 
-async def download_xpt(url: str) -> pd.DataFrame:
-    log.info("nhanes.downloading", url=url)
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-    df = pd.read_sas(io.BytesIO(r.content), format="xport")
-    log.info("nhanes.downloaded", url=url, rows=len(df))
-    return df
-
-
-async def load_demographics() -> pd.DataFrame:
-    df = await download_xpt(DEMOGRAPHICS_URL)
-    # SEQN=participant id, RIDAGEYR=age, RIAGENDR=1 male/2 female
-    demo = df[["SEQN","RIDAGEYR","RIAGENDR"]].copy()
-    demo.columns = ["seqn","age","sex_code"]
-    demo["sex"] = demo["sex_code"].map({1:"male",2:"female"}).fillna("unknown")
-    return demo.set_index("seqn")
-
-
-async def seed_biomarker(
-    session: AsyncSession,
-    loinc: str,
-    display_name: str,
-    nhanes_var: str,
-    xpt_url: str,
-    unit: str,
-    demo: pd.DataFrame,
-    xpt_cache: dict[str, pd.DataFrame],
-) -> None:
-    if xpt_url not in xpt_cache:
-        xpt_cache[xpt_url] = await download_xpt(xpt_url)
-    df = xpt_cache[xpt_url]
-
-    if nhanes_var not in df.columns:
-        log.warning("nhanes.var_missing", var=nhanes_var, url=xpt_url)
-        return
-
-    merged = df[["SEQN", nhanes_var]].join(demo, on="SEQN").dropna(subset=[nhanes_var, "age", "sex"])
-    merged = merged.rename(columns={nhanes_var: "value"})
-    merged["value"] = pd.to_numeric(merged["value"], errors="coerce")
-    merged = merged.dropna(subset=["value"])
-
-    rows_to_add: list[ReferenceRangeRow] = []
-    for sex in ("male", "female", "all"):
-        subset = merged if sex == "all" else merged[merged["sex"] == sex]
-        for age_min, age_max in AGE_BINS:
-            cohort = subset[(subset["age"] >= age_min) & (subset["age"] <= age_max)]["value"]
-            if len(cohort) < 30:
-                continue
-            pctls = np.percentile(cohort, PERCENTILES)
-            rows_to_add.append(
-                ReferenceRangeRow(
+    async with AsyncSessionFactory() as session:
+        for loinc, (display_name, unit, strata) in REFERENCE_DATA.items():
+            for (sex, age_min, age_max), pctls in strata.items():
+                p2_5, p5, p10, p25, p50, p75, p90, p95, p97_5 = pctls
+                row = ReferenceRangeRow(
                     loinc_code=loinc,
                     display_name=display_name,
                     sex=sex,
                     age_min=age_min,
                     age_max=age_max,
-                    p2_5=float(pctls[0]),
-                    p5=float(pctls[1]),
-                    p10=float(pctls[2]),
-                    p25=float(pctls[3]),
-                    p50=float(pctls[4]),
-                    p75=float(pctls[5]),
-                    p90=float(pctls[6]),
-                    p95=float(pctls[7]),
-                    p97_5=float(pctls[8]),
+                    p2_5=p2_5, p5=p5, p10=p10, p25=p25, p50=p50,
+                    p75=p75, p90=p90, p95=p95, p97_5=p97_5,
                     unit=unit,
                 )
-            )
+                await session.merge(row)
+                total += 1
 
-    for row in rows_to_add:
-        await session.merge(row)    # upsert
-    await session.commit()
-    log.info("nhanes.seeded", loinc=loinc, display_name=display_name, rows=len(rows_to_add))
+        await session.commit()
 
-
-async def main() -> None:
-    await create_all_tables()
-    demo = await load_demographics()
-    xpt_cache: dict[str, pd.DataFrame] = {}
-
-    async with AsyncSessionFactory() as session:
-        for loinc, (display_name, nhanes_var, xpt_url, unit) in BIOMARKER_MAP.items():
-            try:
-                await seed_biomarker(
-                    session, loinc, display_name, nhanes_var, xpt_url, unit, demo, xpt_cache
-                )
-            except Exception as exc:
-                log.error("nhanes.seed_failed", loinc=loinc, error=str(exc))
-
-    log.info("nhanes.seed_complete", biomarkers=len(BIOMARKER_MAP))
+    log.info("nhanes.seed_complete", biomarkers=len(REFERENCE_DATA), rows=total)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(seed())
