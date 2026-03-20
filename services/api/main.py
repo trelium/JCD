@@ -6,7 +6,7 @@ Routes:
   GET  /status/{job_id} returns current job state + result when complete
   GET  /report/{job_id} returns rendered HTML report
   GET  /health          liveness probe
-  GET  /ready           readiness probe (checks DB + Kafka)
+  GET  /ready           readiness probe (checks DB)
 """
 from __future__ import annotations
 
@@ -16,18 +16,18 @@ import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated
 
 import structlog
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-from typing import Annotated
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.datastructures import UploadFile
+from fastapi.param_functions import File
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
@@ -71,7 +71,7 @@ app.add_middleware(
 # Dependencies
 # ---------------------------------------------------------------------------
 
-async def get_db() -> AsyncSession:
+async def get_db():
     async with AsyncSessionFactory() as session:
         yield session
 
@@ -89,22 +89,22 @@ class UploadResponse(BaseModel):
 class StatusResponse(BaseModel):
     job_id: str
     status: str
-    patient_id: str | None
-    risk_tier: str | None
-    error: str | None
+    patient_id: str | None = None
+    risk_tier: str | None = None
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.post("/upload", response_model=UploadResponse, status_code=202)
+@app.post("/upload", status_code=202)
 @limiter.limit("20/minute")
 async def upload_fhir(
     request: Request,
-    file: Annotated[UploadFile, File()],
+    file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-) -> UploadResponse:
+):
     """Accept a FHIR Bundle in JSON or XML format."""
     content_type = file.content_type or ""
     filename = file.filename or ""
@@ -129,18 +129,17 @@ async def upload_fhir(
     existing_row = existing.scalar_one_or_none()
     if existing_row:
         log.info("api.duplicate_upload", job_id=str(existing_row.job_id))
-        return UploadResponse(
-            job_id=str(existing_row.job_id),
-            status=existing_row.status,
-            message="Duplicate upload — returning existing job",
-        )
+        return {
+            "job_id": str(existing_row.job_id),
+            "status": existing_row.status,
+            "message": "Duplicate upload — returning existing job",
+        }
 
     job_id = uuid.uuid4()
     job_row = JobRow(
         job_id=job_id,
         input_hash=input_hash,
         status=JobStatus.PENDING,
-        # Store raw bytes + format so validation worker can retrieve them
         parsed_payload={
             "raw_b64": base64.b64encode(raw).decode(),
             "source_format": source_format,
@@ -150,18 +149,18 @@ async def upload_fhir(
     await db.commit()
     log.info("api.upload_accepted", job_id=str(job_id), bytes=len(raw))
 
-    return UploadResponse(
-        job_id=str(job_id),
-        status="pending",
-        message="File accepted. Poll /status/{job_id} for updates.",
-    )
+    return {
+        "job_id": str(job_id),
+        "status": "pending",
+        "message": "File accepted. Poll /status/{job_id} for updates.",
+    }
 
 
-@app.get("/status/{job_id}", response_model=StatusResponse)
+@app.get("/status/{job_id}")
 async def get_status(
     job_id: str,
     db: AsyncSession = Depends(get_db),
-) -> StatusResponse:
+):
     try:
         uid = uuid.UUID(job_id)
     except ValueError:
@@ -175,20 +174,20 @@ async def get_status(
     if row.analysis_result:
         risk_tier = row.analysis_result.get("risk_tier")
 
-    return StatusResponse(
-        job_id=job_id,
-        status=row.status,
-        patient_id=row.patient_id,
-        risk_tier=risk_tier,
-        error=row.error,
-    )
+    return {
+        "job_id": job_id,
+        "status": row.status,
+        "patient_id": row.patient_id,
+        "risk_tier": risk_tier,
+        "error": row.error,
+    }
 
 
 @app.get("/report/{job_id}", response_class=HTMLResponse)
 async def get_report(
     job_id: str,
     db: AsyncSession = Depends(get_db),
-) -> HTMLResponse:
+):
     try:
         uid = uuid.UUID(job_id)
     except ValueError:
@@ -210,35 +209,25 @@ async def get_report(
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+async def health():
+    return {"status": "ok"}
 
 
 @app.get("/ready")
-async def ready(db: AsyncSession = Depends(get_db)) -> JSONResponse:
-    issues: list[str] = []
-
-    # Check DB
+async def ready(db: AsyncSession = Depends(get_db)):
     try:
-        await db.execute(select(1))
+        await db.execute(text("SELECT 1"))
+        return {"status": "ready"}
     except Exception as exc:
-        issues.append(f"db: {exc}")
-
-    # Check Kafka producer
-    if _producer is None:
-        issues.append("kafka: producer not initialised")
-
-    if issues:
-        return JSONResponse({"status": "not ready", "issues": issues}, status_code=503)
-    return JSONResponse({"status": "ready"})
+        return JSONResponse({"status": "not ready", "error": str(exc)}, status_code=503)
 
 
 # ---------------------------------------------------------------------------
-# Simple HTML upload UI
+# Upload UI
 # ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
+async def index():
     return HTMLResponse(content="""
 <!DOCTYPE html>
 <html lang="en">
@@ -344,7 +333,7 @@ async function poll(jobId, attempt=0) {
       res.className = 'ok'; res.style.display = 'block';
       res.innerHTML = '✓ Report ready — Risk tier: <strong>' + (data.risk_tier||'—') + '</strong>'
         + '<div class="job-link"><a href="/report/' + jobId + '" target="_blank">Open full report →</a></div>';
-    } else if (data.status === 'failed') {
+    } else if (data.status === 'failed' || data.status === 'dlq') {
       showErr('Pipeline failed: ' + (data.error || 'unknown error'));
     } else {
       if (attempt < 60) poll(jobId, attempt + 1);
