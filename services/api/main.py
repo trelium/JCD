@@ -1,12 +1,6 @@
 """
 FastAPI service — public-facing.
-
-Routes:
-  POST /upload          accepts FHIR JSON or XML, returns {job_id}
-  GET  /status/{job_id} returns current job state + result when complete
-  GET  /report/{job_id} returns rendered HTML report
-  GET  /health          liveness probe
-  GET  /ready           readiness probe (checks DB)
+Uses Request.form() directly to avoid UploadFile/Pydantic version issues.
 """
 from __future__ import annotations
 
@@ -21,8 +15,6 @@ import structlog
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.datastructures import UploadFile
-from fastapi.param_functions import File
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -51,12 +43,7 @@ async def lifespan(app: FastAPI):
     log.info("api.shutdown")
 
 
-app = FastAPI(
-    title="Biomarker Pipeline API",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
+app = FastAPI(title="Biomarker Pipeline API", version="1.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
@@ -67,31 +54,9 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Dependencies
-# ---------------------------------------------------------------------------
-
 async def get_db():
     async with AsyncSessionFactory() as session:
         yield session
-
-
-# ---------------------------------------------------------------------------
-# Response schemas
-# ---------------------------------------------------------------------------
-
-class UploadResponse(BaseModel):
-    job_id: str
-    status: str
-    message: str
-
-
-class StatusResponse(BaseModel):
-    job_id: str
-    status: str
-    patient_id: str | None = None
-    risk_tier: str | None = None
-    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -100,31 +65,41 @@ class StatusResponse(BaseModel):
 
 @app.post("/upload", status_code=202)
 @limiter.limit("20/minute")
-async def upload_fhir(
-    request: Request,
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-):
-    """Accept a FHIR Bundle in JSON or XML format."""
-    content_type = file.content_type or ""
-    filename = file.filename or ""
+async def upload_fhir(request: Request, db: AsyncSession = Depends(get_db)):
+    """Accept a FHIR Bundle as multipart/form-data or raw body."""
+    content_type = request.headers.get("content-type", "")
 
-    if not (
-        "json" in content_type
-        or "xml" in content_type
-        or filename.endswith(".json")
-        or filename.endswith(".xml")
-    ):
-        raise HTTPException(400, "File must be FHIR JSON or XML")
+    # Handle both multipart upload and raw body post
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        file_field = form.get("file")
+        if file_field is None:
+            raise HTTPException(400, "No file field in form data")
+        raw = await file_field.read()
+        filename = getattr(file_field, "filename", "") or ""
+        file_ct = getattr(file_field, "content_type", "") or ""
+    else:
+        raw = await request.body()
+        filename = ""
+        file_ct = content_type
 
-    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "Empty file")
+
     if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"File exceeds {MAX_UPLOAD_MB} MB limit")
 
-    source_format = "xml" if ("xml" in content_type or filename.endswith(".xml")) else "json"
+    # Detect format
+    is_xml = (
+        "xml" in file_ct
+        or filename.endswith(".xml")
+        or raw.lstrip()[:5] in (b"<?xml", b"<Bund")
+    )
+    source_format = "xml" if is_xml else "json"
+
     input_hash = hashlib.sha256(raw).hexdigest()
 
-    # Idempotency: return existing job if same file was uploaded before
+    # Idempotency
     existing = await db.execute(select(JobRow).where(JobRow.input_hash == input_hash))
     existing_row = existing.scalar_one_or_none()
     if existing_row:
@@ -157,10 +132,7 @@ async def upload_fhir(
 
 
 @app.get("/status/{job_id}")
-async def get_status(
-    job_id: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_status(job_id: str, db: AsyncSession = Depends(get_db)):
     try:
         uid = uuid.UUID(job_id)
     except ValueError:
@@ -184,10 +156,7 @@ async def get_status(
 
 
 @app.get("/report/{job_id}", response_class=HTMLResponse)
-async def get_report(
-    job_id: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_report(job_id: str, db: AsyncSession = Depends(get_db)):
     try:
         uid = uuid.UUID(job_id)
     except ValueError:
@@ -204,10 +173,6 @@ async def get_report(
     return HTMLResponse(content=row.report_result["html_report"])
 
 
-# ---------------------------------------------------------------------------
-# Health / readiness
-# ---------------------------------------------------------------------------
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -222,41 +187,36 @@ async def ready(db: AsyncSession = Depends(get_db)):
         return JSONResponse({"status": "not ready", "error": str(exc)}, status_code=503)
 
 
-# ---------------------------------------------------------------------------
-# Upload UI
-# ---------------------------------------------------------------------------
-
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTMLResponse(content="""
-<!DOCTYPE html>
+    return HTMLResponse(content="""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Biomarker Pipeline</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, sans-serif; background: #f8f9fa; color: #212529; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-  .card { background: white; border-radius: 12px; padding: 2.5rem; max-width: 520px; width: 100%; box-shadow: 0 2px 16px rgba(0,0,0,0.08); }
-  h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 0.25rem; }
-  p.sub { color: #6c757d; font-size: 0.9rem; margin-bottom: 1.75rem; }
-  label { display: block; font-size: 0.85rem; font-weight: 500; margin-bottom: 0.4rem; }
-  .dropzone { border: 2px dashed #dee2e6; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; transition: border-color .2s; background: #fafafa; }
-  .dropzone:hover, .dropzone.over { border-color: #0d6efd; background: #f0f4ff; }
-  .dropzone input { display: none; }
-  .dropzone .hint { font-size: 0.82rem; color: #6c757d; margin-top: 0.5rem; }
-  .filename { margin-top: 0.75rem; font-size: 0.85rem; color: #198754; font-weight: 500; }
-  button { display: block; width: 100%; margin-top: 1.25rem; padding: 0.75rem; background: #0d6efd; color: white; border: none; border-radius: 8px; font-size: 1rem; font-weight: 500; cursor: pointer; transition: background .2s; }
-  button:hover { background: #0b5ed7; }
-  button:disabled { background: #adb5bd; cursor: default; }
-  #result { margin-top: 1.25rem; padding: 1rem; border-radius: 8px; font-size: 0.88rem; display: none; }
-  #result.ok { background: #d1e7dd; color: #0a3622; }
-  #result.err { background: #f8d7da; color: #58151c; }
-  #result.pending { background: #fff3cd; color: #664d03; }
-  .job-link { margin-top: 0.5rem; }
-  .job-link a { color: inherit; font-weight: 600; }
-  #poll-status { margin-top: 0.5rem; font-style: italic; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #f8f9fa; color: #212529; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.card { background: white; border-radius: 12px; padding: 2.5rem; max-width: 520px; width: 100%; box-shadow: 0 2px 16px rgba(0,0,0,0.08); }
+h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 0.25rem; }
+p.sub { color: #6c757d; font-size: 0.9rem; margin-bottom: 1.75rem; }
+label { display: block; font-size: 0.85rem; font-weight: 500; margin-bottom: 0.4rem; }
+.dropzone { border: 2px dashed #dee2e6; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; transition: border-color .2s; background: #fafafa; }
+.dropzone:hover, .dropzone.over { border-color: #0d6efd; background: #f0f4ff; }
+.dropzone input { display: none; }
+.hint { font-size: 0.82rem; color: #6c757d; margin-top: 0.5rem; }
+.filename { margin-top: 0.75rem; font-size: 0.85rem; color: #198754; font-weight: 500; }
+button { display: block; width: 100%; margin-top: 1.25rem; padding: 0.75rem; background: #0d6efd; color: white; border: none; border-radius: 8px; font-size: 1rem; font-weight: 500; cursor: pointer; transition: background .2s; }
+button:hover { background: #0b5ed7; }
+button:disabled { background: #adb5bd; cursor: default; }
+#result { margin-top: 1.25rem; padding: 1rem; border-radius: 8px; font-size: 0.88rem; display: none; }
+#result.ok { background: #d1e7dd; color: #0a3622; }
+#result.err { background: #f8d7da; color: #58151c; }
+#result.pending { background: #fff3cd; color: #664d03; }
+.job-link { margin-top: 0.5rem; }
+.job-link a { color: inherit; font-weight: 600; }
+#poll-status { margin-top: 0.5rem; font-style: italic; }
 </style>
 </head>
 <body>
@@ -274,73 +234,47 @@ async def index():
   <div id="result"></div>
 </div>
 <script>
-const dz = document.getElementById('dz');
-const fi = document.getElementById('file-input');
-const btn = document.getElementById('submit-btn');
-const res = document.getElementById('result');
-const fname = document.getElementById('fname');
-let selectedFile = null;
-
-dz.addEventListener('click', () => fi.click());
-dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); });
-dz.addEventListener('dragleave', () => dz.classList.remove('over'));
-dz.addEventListener('drop', e => {
-  e.preventDefault(); dz.classList.remove('over');
-  const f = e.dataTransfer.files[0]; if (f) setFile(f);
+const dz=document.getElementById('dz'),fi=document.getElementById('file-input'),
+btn=document.getElementById('submit-btn'),res=document.getElementById('result'),
+fname=document.getElementById('fname');
+let selectedFile=null;
+dz.addEventListener('click',()=>fi.click());
+dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('over');});
+dz.addEventListener('dragleave',()=>dz.classList.remove('over'));
+dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('over');const f=e.dataTransfer.files[0];if(f)setFile(f);});
+fi.addEventListener('change',()=>{if(fi.files[0])setFile(fi.files[0]);});
+function setFile(f){selectedFile=f;fname.textContent=f.name+' ('+(f.size/1024).toFixed(1)+' KB)';btn.disabled=false;}
+btn.addEventListener('click',async()=>{
+  if(!selectedFile)return;
+  btn.disabled=true;res.style.display='none';
+  const form=new FormData();form.append('file',selectedFile);
+  try{
+    const r=await fetch('/upload',{method:'POST',body:form});
+    const data=await r.json();
+    if(!r.ok){showErr(data.detail||'Upload failed');btn.disabled=false;return;}
+    showPending(data.job_id);poll(data.job_id);
+  }catch(e){showErr('Network error');btn.disabled=false;}
 });
-fi.addEventListener('change', () => { if (fi.files[0]) setFile(fi.files[0]); });
-
-function setFile(f) {
-  selectedFile = f;
-  fname.textContent = f.name + ' (' + (f.size/1024).toFixed(1) + ' KB)';
-  btn.disabled = false;
+function showPending(jobId){
+  res.className='pending';res.style.display='block';
+  res.innerHTML='Processing… <div id="poll-status">Waiting for pipeline...</div><div class="job-link">Job ID: <a href="/status/'+jobId+'" target="_blank">'+jobId+'</a></div>';
 }
-
-btn.addEventListener('click', async () => {
-  if (!selectedFile) return;
-  btn.disabled = true;
-  res.style.display = 'none';
-  const form = new FormData();
-  form.append('file', selectedFile);
-  try {
-    const r = await fetch('/upload', { method: 'POST', body: form });
-    const data = await r.json();
-    if (!r.ok) { showErr(data.detail || 'Upload failed'); btn.disabled = false; return; }
-    showPending(data.job_id);
-    poll(data.job_id);
-  } catch(e) { showErr('Network error'); btn.disabled = false; }
-});
-
-function showPending(jobId) {
-  res.className = 'pending'; res.style.display = 'block';
-  res.innerHTML = 'Processing… <div id="poll-status">Waiting for pipeline...</div>'
-    + '<div class="job-link">Job ID: <a href="/status/' + jobId + '" target="_blank">' + jobId + '</a></div>';
-}
-
-function showErr(msg) {
-  res.className = 'err'; res.style.display = 'block';
-  res.textContent = '⚠ ' + msg;
-}
-
-async function poll(jobId, attempt=0) {
-  await new Promise(r => setTimeout(r, 2000 + attempt * 1000));
-  try {
-    const r = await fetch('/status/' + jobId);
-    const data = await r.json();
-    const ps = document.getElementById('poll-status');
-    if (ps) ps.textContent = 'Status: ' + data.status + (data.risk_tier ? ' · Risk: ' + data.risk_tier : '');
-    if (data.status === 'complete') {
-      res.className = 'ok'; res.style.display = 'block';
-      res.innerHTML = '✓ Report ready — Risk tier: <strong>' + (data.risk_tier||'—') + '</strong>'
-        + '<div class="job-link"><a href="/report/' + jobId + '" target="_blank">Open full report →</a></div>';
-    } else if (data.status === 'failed' || data.status === 'dlq') {
-      showErr('Pipeline failed: ' + (data.error || 'unknown error'));
-    } else {
-      if (attempt < 60) poll(jobId, attempt + 1);
-    }
-  } catch(e) { if (attempt < 60) poll(jobId, attempt+1); }
+function showErr(msg){res.className='err';res.style.display='block';res.textContent='⚠ '+msg;}
+async function poll(jobId,attempt=0){
+  await new Promise(r=>setTimeout(r,2000+attempt*1000));
+  try{
+    const r=await fetch('/status/'+jobId);
+    const data=await r.json();
+    const ps=document.getElementById('poll-status');
+    if(ps)ps.textContent='Status: '+data.status+(data.risk_tier?' · Risk: '+data.risk_tier:'');
+    if(data.status==='complete'){
+      res.className='ok';res.style.display='block';
+      res.innerHTML='✓ Report ready — Risk tier: <strong>'+(data.risk_tier||'—')+'</strong><div class="job-link"><a href="/report/'+jobId+'" target="_blank">Open full report →</a></div>';
+    }else if(data.status==='failed'||data.status==='dlq'){
+      showErr('Pipeline failed: '+(data.error||'unknown error'));
+    }else{if(attempt<60)poll(jobId,attempt+1);}
+  }catch(e){if(attempt<60)poll(jobId,attempt+1);}
 }
 </script>
 </body>
-</html>
-""")
+</html>""")
