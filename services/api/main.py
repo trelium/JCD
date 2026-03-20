@@ -19,7 +19,6 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 import structlog
-from confluent_kafka import Producer
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -33,34 +32,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from shared.db.database import AsyncSessionFactory, JobRow, create_all_tables
-from shared.kafka.kafka_utils import ensure_topics, get_producer, publish
 from shared.logging_config import configure_logging
-from shared.models.models import Job, JobStatus, KafkaIngestMessage
+from shared.models.models import JobStatus
 
 configure_logging()
 log = structlog.get_logger()
 
-TOPIC_INGEST = "fhir-ingest"
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "10"))
 limiter = Limiter(key_func=get_remote_address)
-
-# ---------------------------------------------------------------------------
-# Application lifecycle
-# ---------------------------------------------------------------------------
-
-_producer: Producer | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _producer
     await create_all_tables()
-    ensure_topics([TOPIC_INGEST, TOPIC_INGEST + ".dlq"])
-    _producer = get_producer()
     log.info("api.started")
     yield
-    if _producer:
-        _producer.flush(timeout=10)
     log.info("api.shutdown")
 
 
@@ -153,17 +139,14 @@ async def upload_fhir(
         job_id=job_id,
         input_hash=input_hash,
         status=JobStatus.PENDING,
+        # Store raw bytes + format so validation worker can retrieve them
+        parsed_payload={
+            "raw_b64": base64.b64encode(raw).decode(),
+            "source_format": source_format,
+        },
     )
     db.add(job_row)
     await db.commit()
-
-    msg = KafkaIngestMessage(
-        job_id=str(job_id),
-        input_hash=input_hash,
-        raw_bytes_b64=base64.b64encode(raw).decode(),
-        source_format=source_format,
-    )
-    publish(_producer, TOPIC_INGEST, str(job_id), msg.model_dump())
     log.info("api.upload_accepted", job_id=str(job_id), bytes=len(raw))
 
     return UploadResponse(

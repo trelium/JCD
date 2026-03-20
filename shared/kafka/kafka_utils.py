@@ -1,163 +1,153 @@
 """
-Thin wrappers around confluent-kafka that add:
-  - structured logging on every produce/consume event
-  - automatic retry with exponential back-off on transient errors
-  - dead-letter topic routing on repeated failures
+Postgres-based job queue — drop-in replacement for the Kafka-based transport.
+
+Preserves the same architectural pattern (producer/consumer, stages, DLQ,
+retry with back-off) but uses the existing Postgres jobs table as the
+message bus instead of a Kafka broker.
+
+Each pipeline stage is modelled as a status transition:
+  pending      → claimed by validation worker
+  validating   → claimed by analysis worker  (after validation done)
+  analyzing    → claimed by report worker    (after analysis done)
+  reporting    → complete
+
+Workers poll for jobs in their input status, process them, and advance
+the status. A failed job is retried up to max_retries times before being
+marked dlq (dead-letter queue equivalent).
+
+SELECT FOR UPDATE SKIP LOCKED ensures multiple worker replicas never
+double-process the same job — this is the standard Postgres queue pattern
+used in production by many systems (Sidekiq, River, Que, etc).
 """
 from __future__ import annotations
 
-import json
+import asyncio
 import os
-import time
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 import structlog
-from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
-from confluent_kafka.admin import AdminClient, NewTopic
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from shared.db.database import AsyncSessionFactory, JobRow
+from shared.models.models import JobStatus
 
 log = structlog.get_logger()
 
-BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-DLQ_SUFFIX = ".dlq"
+POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
+
 
 # ---------------------------------------------------------------------------
-# Admin helpers
+# Core polling loop
 # ---------------------------------------------------------------------------
 
-def ensure_topics(topics: list[str], num_partitions: int = 3, replication: int = 1) -> None:
-    """Create topics if they don't exist (idempotent)."""
-    admin = AdminClient({"bootstrap.servers": BOOTSTRAP_SERVERS})
-    existing = set(admin.list_topics(timeout=10).topics.keys())
-    to_create = [
-        NewTopic(t, num_partitions=num_partitions, replication_factor=replication)
-        for t in topics
-        if t not in existing
-    ]
-    if not to_create:
-        return
-    futures = admin.create_topics(to_create)
-    for topic, future in futures.items():
+async def consume_loop_async(
+    worker_name: str,
+    input_status: str,
+    handler: Callable,
+    max_retries: int = 3,
+) -> None:
+    log.info("worker.started", worker=worker_name, polling_status=input_status)
+
+    while True:
         try:
-            future.result()
-            log.info("kafka.topic_created", topic=topic)
-        except KafkaException as e:
-            if "TOPIC_ALREADY_EXISTS" not in str(e):
-                raise
+            async with AsyncSessionFactory() as session:
+                # SELECT FOR UPDATE SKIP LOCKED — safe for N concurrent replicas
+                stmt = (
+                    select(JobRow)
+                    .where(JobRow.status == input_status)
+                    .order_by(JobRow.created_at)
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                result = await session.execute(stmt)
+                row = result.scalar_one_or_none()
 
+                if row is None:
+                    await session.rollback()
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
 
-# ---------------------------------------------------------------------------
-# Producer
-# ---------------------------------------------------------------------------
+                job_id = row.job_id
+                attempt = _parse_attempt(row.error)
+                log.info("worker.claimed", worker=worker_name, job_id=str(job_id))
 
-def get_producer() -> Producer:
-    return Producer(
-        {
-            "bootstrap.servers": BOOTSTRAP_SERVERS,
-            "acks": "all",                      # wait for all replicas
-            "retries": 5,
-            "retry.backoff.ms": 200,
-            "enable.idempotence": True,
-        }
-    )
+                try:
+                    await handler(row, session)
+                    log.info("worker.complete", worker=worker_name, job_id=str(job_id))
 
+                except Exception as exc:
+                    attempt += 1
+                    log.warning(
+                        "worker.failed",
+                        worker=worker_name,
+                        job_id=str(job_id),
+                        attempt=attempt,
+                        error=str(exc),
+                    )
+                    wait = 0.5 * (2 ** (attempt - 1))
+                    await asyncio.sleep(wait)
 
-def publish(producer: Producer, topic: str, key: str, payload: dict[str, Any]) -> None:
-    def ack(err: Any, msg: Any) -> None:
-        if err:
-            log.error("kafka.produce_error", topic=topic, key=key, error=str(err))
-        else:
-            log.debug("kafka.produced", topic=topic, key=key, offset=msg.offset())
+                    new_status = "dlq" if attempt >= max_retries else input_status
+                    if new_status == "dlq":
+                        log.error("worker.dlq", job_id=str(job_id), error=str(exc))
 
-    producer.produce(
-        topic,
-        key=key.encode(),
-        value=json.dumps(payload).encode(),
-        callback=ack,
-    )
-    producer.poll(0)
+                    await session.execute(
+                        update(JobRow)
+                        .where(JobRow.job_id == job_id)
+                        .values(
+                            status=new_status,
+                            error=f"[attempt {attempt}] {str(exc)}",
+                            updated_at=datetime.utcnow(),
+                        )
+                    )
+                    await session.commit()
 
-
-# ---------------------------------------------------------------------------
-# Consumer
-# ---------------------------------------------------------------------------
-
-def get_consumer(group_id: str, topics: list[str]) -> Consumer:
-    consumer = Consumer(
-        {
-            "bootstrap.servers": BOOTSTRAP_SERVERS,
-            "group.id": group_id,
-            "auto.offset.reset": "earliest",
-            "enable.auto.commit": False,        # manual commit after processing
-            "max.poll.interval.ms": 300_000,
-            "session.timeout.ms": 30_000,
-        }
-    )
-    consumer.subscribe(topics)
-    return consumer
+        except Exception as exc:
+            log.error("worker.loop_error", worker=worker_name, error=str(exc))
+            await asyncio.sleep(5)
 
 
 def consume_loop(
-    consumer: Consumer,
-    producer: Producer,
-    handler: Callable[[dict[str, Any]], None],
+    worker_name: str,
+    input_status: str,
+    handler: Callable,
     max_retries: int = 3,
 ) -> None:
-    """
-    Blocking consume loop.
-    - Deserialises JSON messages
-    - Calls handler
-    - On failure retries up to max_retries with exponential back-off
-    - After max_retries routes message to <topic>.dlq
-    - Commits offset only on success or DLQ routing
-    """
-    while True:
-        msg = consumer.poll(timeout=1.0)
-        if msg is None:
-            continue
-        if msg.error():
-            if msg.error().code() == KafkaError._PARTITION_EOF:
-                continue
-            log.error("kafka.consumer_error", error=str(msg.error()))
-            continue
-
-        topic = msg.topic()
-        raw = msg.value()
-
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            log.error("kafka.bad_json", topic=topic, error=str(exc))
-            _send_to_dlq(producer, topic, raw)
-            consumer.commit(message=msg)
-            continue
-
-        last_exc: Exception | None = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                handler(payload)
-                consumer.commit(message=msg)
-                log.info("kafka.message_processed", topic=topic, attempt=attempt)
-                break
-            except Exception as exc:
-                last_exc = exc
-                wait = 0.2 * (2 ** (attempt - 1))
-                log.warning(
-                    "kafka.handler_error",
-                    topic=topic,
-                    attempt=attempt,
-                    error=str(exc),
-                    retry_in=wait,
-                )
-                time.sleep(wait)
-        else:
-            log.error("kafka.max_retries_exceeded", topic=topic, error=str(last_exc))
-            _send_to_dlq(producer, topic, raw)
-            consumer.commit(message=msg)
+    """Sync entry point."""
+    asyncio.run(consume_loop_async(worker_name, input_status, handler, max_retries))
 
 
-def _send_to_dlq(producer: Producer, origin_topic: str, raw: bytes) -> None:
-    dlq_topic = origin_topic + DLQ_SUFFIX
-    producer.produce(dlq_topic, value=raw)
-    producer.poll(0)
-    log.warning("kafka.sent_to_dlq", dlq_topic=dlq_topic)
+# ---------------------------------------------------------------------------
+# No-op stubs — keep existing imports working
+# ---------------------------------------------------------------------------
+
+def get_producer():
+    return None
+
+def get_consumer(group_id: str, topics: list[str]):
+    return None
+
+def ensure_topics(topics: list[str], **kwargs) -> None:
+    pass
+
+def publish(producer: Any, topic: str, key: str, payload: dict) -> None:
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_attempt(error: str | None) -> int:
+    if not error:
+        return 0
+    try:
+        if error.startswith("[attempt "):
+            return int(error.split("]")[0].replace("[attempt ", ""))
+    except Exception:
+        pass
+    return 0
