@@ -45,7 +45,7 @@ def _parse_json(raw: bytes) -> ParsedFHIRPayload:
     import json
 
     data = json.loads(raw)
-    bundle = Bundle.model_validate(data)
+    bundle = Bundle.parse_obj(data)
 
     demographics = PatientDemographics(patient_id="unknown")
     observations: list[BiomarkerObservation] = []
