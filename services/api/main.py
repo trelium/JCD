@@ -20,6 +20,7 @@ from typing import Annotated
 
 import structlog
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from typing import Annotated
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -101,7 +102,7 @@ class StatusResponse(BaseModel):
 @limiter.limit("20/minute")
 async def upload_fhir(
     request: Request,
-    file: UploadFile = File(...),
+    file: Annotated[UploadFile, File()],
     db: AsyncSession = Depends(get_db),
 ) -> UploadResponse:
     """Accept a FHIR Bundle in JSON or XML format."""
