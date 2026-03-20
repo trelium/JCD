@@ -1,24 +1,16 @@
 """
-Parse a raw FHIR Bundle (JSON or XML) into our internal ParsedFHIRPayload.
+Parse a FHIR Bundle (JSON or XML) into our internal ParsedFHIRPayload.
 
-Supports:
-  - FHIR R4 Bundle containing Patient + Observation resources
-  - LOINC-coded observations (blood panel results)
-  - Both JSON and XML serialisations
-
-We use fhir.resources for JSON parsing (it validates the schema) and
-xml.etree for XML (avoiding a heavy lxml dependency).
+No fhir.resources dependency — plain json/xml parsing only.
+Supports FHIR R4 Bundles containing Patient + Observation resources.
 """
 from __future__ import annotations
 
-import re
+import json
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
 import structlog
-from fhir.resources.bundle import Bundle
-from fhir.resources.observation import Observation
-from fhir.resources.patient import Patient
 
 from shared.models.models import (
     BiomarkerObservation,
@@ -27,7 +19,6 @@ from shared.models.models import (
 )
 
 log = structlog.get_logger()
-
 FHIR_NS = "http://hl7.org/fhir"
 
 
@@ -42,99 +33,92 @@ def parse_fhir(raw: bytes, source_format: str) -> ParsedFHIRPayload:
 # ---------------------------------------------------------------------------
 
 def _parse_json(raw: bytes) -> ParsedFHIRPayload:
-    import json
-
     data = json.loads(raw)
-    bundle = Bundle.parse_obj(data)
-
+    entries = data.get("entry", [])
     demographics = PatientDemographics(patient_id="unknown")
     observations: list[BiomarkerObservation] = []
-    resource_count = len(bundle.entry or [])
 
-    for entry in bundle.entry or []:
-        resource = entry.resource
-        if resource is None:
-            continue
-
-        if resource.resource_type == "Patient":
-            demographics = _extract_demographics_json(resource)
-        elif resource.resource_type == "Observation":
-            obs = _extract_observation_json(resource)
+    for entry in entries:
+        resource = entry.get("resource", {})
+        rtype = resource.get("resourceType", "")
+        if rtype == "Patient":
+            demographics = _demographics_from_json(resource)
+        elif rtype == "Observation":
+            obs = _observation_from_json(resource)
             if obs:
                 observations.append(obs)
 
     return ParsedFHIRPayload(
         demographics=demographics,
         observations=observations,
-        raw_resource_count=resource_count,
+        raw_resource_count=len(entries),
         source_format="json",
     )
 
 
-def _extract_demographics_json(patient: Patient) -> PatientDemographics:
-    patient_id = patient.id or "unknown"
+def _demographics_from_json(r: dict) -> PatientDemographics:
+    patient_id = r.get("id", "unknown")
     age: int | None = None
     sex: str | None = None
 
-    if patient.birthDate:
+    bd = r.get("birthDate")
+    if bd:
         try:
-            bd = datetime.strptime(str(patient.birthDate), "%Y-%m-%d")
-            age = (datetime.utcnow() - bd).days // 365
+            age = (datetime.utcnow() - datetime.strptime(bd, "%Y-%m-%d")).days // 365
         except Exception:
             pass
 
-    if patient.gender:
-        sex = "male" if patient.gender == "male" else "female"
+    g = r.get("gender", "")
+    if g in ("male", "female"):
+        sex = g
 
     return PatientDemographics(patient_id=patient_id, age=age, sex=sex)
 
 
-def _extract_observation_json(obs: Observation) -> BiomarkerObservation | None:
-    # Must have a LOINC code
+def _observation_from_json(r: dict) -> BiomarkerObservation | None:
     loinc_code: str | None = None
-    display_name: str = "Unknown"
+    display_name = "Unknown"
 
-    if obs.code and obs.code.coding:
-        for coding in obs.code.coding:
-            if coding.system and "loinc" in coding.system.lower():
-                loinc_code = coding.code
-                display_name = coding.display or display_name
-                break
+    for coding in r.get("code", {}).get("coding", []):
+        if "loinc" in (coding.get("system") or "").lower():
+            loinc_code = coding.get("code")
+            display_name = coding.get("display", display_name)
+            break
 
     if not loinc_code:
         return None
 
-    # Numeric value
-    value: float | None = None
-    unit: str = ""
-    ref_low: float | None = None
-    ref_high: float | None = None
-
-    if obs.valueQuantity:
-        value = obs.valueQuantity.value
-        unit = obs.valueQuantity.unit or ""
-
-    if value is None:
+    vq = r.get("valueQuantity", {})
+    try:
+        value = float(vq.get("value", ""))
+    except (TypeError, ValueError):
         return None
 
-    if obs.referenceRange:
-        rr = obs.referenceRange[0]
-        if rr.low and rr.low.value is not None:
-            ref_low = float(rr.low.value)
-        if rr.high and rr.high.value is not None:
-            ref_high = float(rr.high.value)
+    unit = vq.get("unit", "")
+
+    ref_low = ref_high = None
+    for rr in r.get("referenceRange", []):
+        try:
+            ref_low = float(rr.get("low", {}).get("value", ""))
+        except (TypeError, ValueError):
+            pass
+        try:
+            ref_high = float(rr.get("high", {}).get("value", ""))
+        except (TypeError, ValueError):
+            pass
 
     effective: datetime | None = None
-    if obs.effectiveDateTime:
+    ed = r.get("effectiveDateTime")
+    if ed:
         try:
-            effective = datetime.fromisoformat(str(obs.effectiveDateTime).replace("Z", "+00:00"))
+            effective = datetime.fromisoformat(ed.replace("Z", "+00:00"))
         except Exception:
             pass
 
     return BiomarkerObservation(
         loinc_code=loinc_code,
         display_name=display_name,
-        value=float(value),
+        value=value,
         unit=unit,
         reference_low=ref_low,
         reference_high=ref_high,
@@ -149,102 +133,89 @@ def _extract_observation_json(obs: Observation) -> BiomarkerObservation | None:
 def _parse_xml(raw: bytes) -> ParsedFHIRPayload:
     root = ET.fromstring(raw)
 
-    def ns(tag: str) -> str:
-        return f"{{{FHIR_NS}}}{tag}"
+    def tag(name: str) -> str:
+        return f"{{{FHIR_NS}}}{name}"
 
-    def val(el: ET.Element | None) -> str | None:
-        if el is None:
-            return None
-        v = el.get("value")
-        return v
+    def val(el) -> str | None:
+        return el.get("value") if el is not None else None
 
     demographics = PatientDemographics(patient_id="unknown")
     observations: list[BiomarkerObservation] = []
-    resource_count = 0
+    count = 0
 
-    for entry in root.findall(f".//{ns('entry')}"):
-        resource_count += 1
-        patient_el = entry.find(f".//{ns('Patient')}")
-        obs_el = entry.find(f".//{ns('Observation')}")
-
+    for entry in root.findall(f".//{tag('entry')}"):
+        count += 1
+        patient_el = entry.find(f".//{tag('Patient')}")
+        obs_el = entry.find(f".//{tag('Observation')}")
         if patient_el is not None:
-            demographics = _extract_demographics_xml(patient_el, ns, val)
+            demographics = _demographics_from_xml(patient_el, tag, val)
         elif obs_el is not None:
-            obs = _extract_observation_xml(obs_el, ns, val)
+            obs = _observation_from_xml(obs_el, tag, val)
             if obs:
                 observations.append(obs)
 
     return ParsedFHIRPayload(
         demographics=demographics,
         observations=observations,
-        raw_resource_count=resource_count,
+        raw_resource_count=count,
         source_format="xml",
     )
 
 
-def _extract_demographics_xml(el, ns, val) -> PatientDemographics:
-    patient_id = val(el.find(f"{ns('id')}")) or "unknown"
+def _demographics_from_xml(el, tag, val) -> PatientDemographics:
+    patient_id = val(el.find(tag("id"))) or "unknown"
     age: int | None = None
     sex: str | None = None
 
-    bd_el = el.find(f"{ns('birthDate')}")
-    if bd_el is not None:
-        bd_str = val(bd_el)
-        if bd_str:
-            try:
-                bd = datetime.strptime(bd_str, "%Y-%m-%d")
-                age = (datetime.utcnow() - bd).days // 365
-            except Exception:
-                pass
+    bd = val(el.find(tag("birthDate")))
+    if bd:
+        try:
+            age = (datetime.utcnow() - datetime.strptime(bd, "%Y-%m-%d")).days // 365
+        except Exception:
+            pass
 
-    gender_el = el.find(f"{ns('gender')}")
-    if gender_el is not None:
-        g = val(gender_el) or ""
-        sex = "male" if g == "male" else "female"
+    g = val(el.find(tag("gender"))) or ""
+    if g in ("male", "female"):
+        sex = g
 
     return PatientDemographics(patient_id=patient_id, age=age, sex=sex)
 
 
-def _extract_observation_xml(el, ns, val) -> BiomarkerObservation | None:
+def _observation_from_xml(el, tag, val) -> BiomarkerObservation | None:
     loinc_code: str | None = None
     display_name = "Unknown"
 
-    for coding in el.findall(f".//{ns('coding')}"):
-        system = val(coding.find(ns("system"))) or ""
+    for coding in el.findall(f".//{tag('coding')}"):
+        system = val(coding.find(tag("system"))) or ""
         if "loinc" in system.lower():
-            loinc_code = val(coding.find(ns("code")))
-            display_name = val(coding.find(ns("display"))) or display_name
+            loinc_code = val(coding.find(tag("code")))
+            display_name = val(coding.find(tag("display"))) or display_name
             break
 
     if not loinc_code:
         return None
 
-    vq = el.find(f".//{ns('valueQuantity')}")
+    vq = el.find(f".//{tag('valueQuantity')}")
     if vq is None:
         return None
 
-    value_str = val(vq.find(ns("value")))
-    if value_str is None:
-        return None
-
     try:
-        value = float(value_str)
-    except ValueError:
+        value = float(val(vq.find(tag("value"))) or "")
+    except (TypeError, ValueError):
         return None
 
-    unit = val(vq.find(ns("unit"))) or ""
+    unit = val(vq.find(tag("unit"))) or ""
 
-    ref_low: float | None = None
-    ref_high: float | None = None
-    for rr in el.findall(f".//{ns('referenceRange')}"):
-        low_el = rr.find(f".//{ns('low')}/{ns('value')}")
-        high_el = rr.find(f".//{ns('high')}/{ns('value')}")
-        if low_el is not None:
-            try: ref_low = float(val(low_el) or "")
-            except Exception: pass
-        if high_el is not None:
-            try: ref_high = float(val(high_el) or "")
-            except Exception: pass
+    ref_low = ref_high = None
+    for rr in el.findall(f".//{tag('referenceRange')}"):
+        try:
+            ref_low = float(val(rr.find(f".//{tag('low')}/{tag('value')}")) or "")
+        except (TypeError, ValueError):
+            pass
+        try:
+            ref_high = float(val(rr.find(f".//{tag('high')}/{tag('value')}")) or "")
+        except (TypeError, ValueError):
+            pass
 
     return BiomarkerObservation(
         loinc_code=loinc_code,
